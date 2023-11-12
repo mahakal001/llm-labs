@@ -12,6 +12,9 @@ class AttentionHead(nn.Module):
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
         self.dropout = nn.Dropout(dropout_rate)
 
+        # use flash attention or a manual implementation?
+        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+
     def forward(self, x):
         B, T, C = x.shape
         k = self.key(x)
@@ -68,12 +71,18 @@ class FeedForward(nn.Module):
 class Block(nn.Module):
     """Transformer Block: communication followed by computation"""
 
-    def __init__(self, n_embd, n_head, block_size, dropout_rate):
+    def __init__(self, n_embd, n_head, block_size, dropout_rate, use_flash=True):
         super().__init__()
         head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(
-            n_head, head_size, n_embd, block_size, dropout_rate
-        )
+        if use_flash:
+            self.sa = FlashMultiHeadAttention(
+                n_head, head_size, n_embd, block_size, dropout_rate
+            )
+        else:
+            self.sa = MultiHeadAttention(
+                n_head, head_size, n_embd, block_size, dropout_rate
+            )
+
         self.ffwd = FeedForward(n_embd)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
@@ -83,6 +92,64 @@ class Block(nn.Module):
         x = x + self.ffwd(self.ln2(x))
 
         return x
+
+
+class FlashMultiHeadAttention(nn.Module):
+    """Combines Single Attentino and Multi Head attention in one block"""
+
+    def __init__(self, num_heads, head_size, n_embd, block_size, dropout_rate):
+        super().__init__()
+        assert n_embd % num_heads == 0
+
+        self.c_attn = nn.Linear(
+            n_embd, 3 * n_embd, bias=False
+        )  # This layer is equivalent to computing k,q,v in Attention above
+        # output projection
+        self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
+
+        # regularization
+        self.attn_dropout = nn.Dropout(dropout_rate)
+        self.resid_dropout = nn.Dropout(dropout_rate)
+        self.n_head = num_heads
+        self.n_embd = n_embd
+        self.dropout_rate = dropout_rate
+        self.head_size = head_size
+
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+        if self.flash:
+            print("self attention would be used")
+
+    def forward(self, x, is_training=True):
+        (
+            B,
+            T,
+            C,
+        ) = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        k, q, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, self.head_size).transpose(1, 2)  # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, self.head_size).transpose(1, 2)  # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, self.head_size).transpose(1, 2)  # (B, nh, T, hs)
+
+        y = None
+        if self.flash:
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                dropout_p=self.dropout_rate if is_training else 0,
+                is_causal=True,
+            )
+            y = (
+                y.transpose(1, 2).contiguous().view(B, T, C)
+            )  # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
 
 
 class GptModel(nn.Module):
@@ -104,7 +171,7 @@ class GptModel(nn.Module):
                 for _ in range(n_layer)
             ]
         )
-        self.ln_f = nn.LayerNorm(n_embd) # final layer norm
+        self.ln_f = nn.LayerNorm(n_embd)  # final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
         self.device = device
 
@@ -119,7 +186,7 @@ class GptModel(nn.Module):
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
-        
+
         if targets is None:
             loss = None
         else:

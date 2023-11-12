@@ -87,9 +87,7 @@ learning_rate = 1e-3
 # create a pytorch optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
 
-trainable_params = sum(
-	p.numel() for p in model.parameters() if p.requires_grad
-)
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"Total trainable params:- {trainable_params}")
 
 for iter in range(config.max_iters):
